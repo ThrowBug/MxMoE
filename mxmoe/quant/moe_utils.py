@@ -24,7 +24,11 @@ def recover_weight_from_cpu(model: PreTrainedModel, weights: list[list[torch.Ten
 def is_non_moe_layer(model_id: str, layer_idx: int):
     if model_id == "mixtral":
         return False
-    elif model_id in ["qwen2_moe", "qwen2_moe_57b"]:
+    elif model_id in [
+        "qwen2_moe",
+        "qwen2_moe_57b",
+        "qwen3_moe_30b_a3b_instruct_2507",
+    ]:
         return False
     elif model_id == "ds2":
         # TODO:
@@ -121,6 +125,9 @@ def get_expert_linears(model: PreTrainedModel, layer_idx: int = -1, exclude_non_
             for expert in layer.mlp.experts:
                 experts[layer_i].append(expert)
             experts[layer_i].append(layer.mlp.shared_expert)
+        elif model_type == "qwen3_moe":
+            for expert in layer.mlp.experts:
+                experts[layer_i].append(expert)
         else:
             raise NotImplementedError(f"Unsupported model type: {model_type}")
     if layer_idx != -1:
@@ -151,6 +158,10 @@ def get_moe_gate_linears(model: PreTrainedModel, layer_idx: int = -1) -> list[nn
             if gate is not None: expert_gates[layer_i].append(gate)
             shared_expert_gate = getattr(layer.mlp, "shared_expert_gate", None)
             if shared_expert_gate is not None: expert_gates[layer_i].append(shared_expert_gate)
+        elif model_type == "qwen3_moe":
+            gate = getattr(layer.mlp, "gate", None)
+            if gate is not None:
+                expert_gates[layer_i].append(gate)
         else:
             raise NotImplementedError(f"Unsupported model type: {model_type}")
     if layer_idx != -1:
@@ -191,10 +202,16 @@ MOE_MLP_NAME_MAP = {
     "ds2": "mlp",
     "qwen2_moe": "mlp",
     "qwen2_moe_57b": "mlp",
+    "qwen3_moe_30b_a3b_instruct_2507": "mlp",
     "mixtral": "block_sparse_moe",
 }
 MOE_WEIGHT_NAME_MAP = {
-    **dict.fromkeys(["ds2", "qwen2_moe", "qwen2_moe_57b"], {
+    **dict.fromkeys([
+        "ds2",
+        "qwen2_moe",
+        "qwen2_moe_57b",
+        "qwen3_moe_30b_a3b_instruct_2507",
+    ], {
         "gate": "gate_proj",
         "up": "up_proj",
         "down": "down_proj",
@@ -225,6 +242,7 @@ def get_linears_in_one_expert(expert: nn.Module) -> dict[str, nn.Linear]:
 
 
 def get_device_map(model_id: str):
+    device_map = "auto"
     if torch.cuda.device_count() == 2:
         if model_id == "qwen2_moe_57b":
             device_map = {
@@ -273,9 +291,6 @@ def get_device_map(model_id: str):
                 "model.norm": "cuda:3",
                 "lm_head": 3,
             }
-    else:
-        device_map = "auto"
-
     return device_map
 
 def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
@@ -283,6 +298,10 @@ def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
     from transformers import AutoModelForCausalLM, AutoConfig
     from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
     from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
+    except ImportError:
+        Qwen3MoeDecoderLayer = None
 
     from accelerate import load_checkpoint_and_dispatch, init_empty_weights
     from mxmoe.quant.rotation import fuse_layer_norms
@@ -304,14 +323,15 @@ def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
         fuse_layer_norms(model)
 
     ckpt = ckpt if ckpt is not None else model_name
+    no_split_module_classes = [MixtralDecoderLayer, Qwen2MoeDecoderLayer]
+    if Qwen3MoeDecoderLayer is not None:
+        no_split_module_classes.append(Qwen3MoeDecoderLayer)
+
     model = load_checkpoint_and_dispatch(
         model,
         checkpoint=ckpt,
         device_map = get_device_map(model_id),
-        no_split_module_classes=[
-            MixtralDecoderLayer,
-            Qwen2MoeDecoderLayer,
-        ],
+        no_split_module_classes=no_split_module_classes,
     )
     return model
 

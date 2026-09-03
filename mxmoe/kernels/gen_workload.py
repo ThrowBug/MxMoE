@@ -11,6 +11,7 @@ MODEL_ID_TO_LAYERS = {
     "qwen2_moe_57b": 28,
     "ds2": 27,
     "mixtral": 32,
+    "qwen3_moe_30b_a3b_instruct_2507": 48,
 }
 
 MODEL_ID_TO_TRACE_FILE = {
@@ -19,7 +20,18 @@ MODEL_ID_TO_TRACE_FILE = {
             d: f"{CUR_DIR}/calib/gate/{k}/{d}/4096/moe-gate.json"
             for d in ["wiki2", "humaneval-x"]
         }
-        for k in ["qwen2_moe", "qwen2_moe_57b", "ds2", "mixtral"]
+        for k in [
+            "qwen2_moe",
+            "qwen2_moe_57b",
+            "ds2",
+            "mixtral",
+        ]
+    },
+    "qwen3_moe_30b_a3b_instruct_2507": {
+        "c4": (
+            f"{CUR_DIR}/calib/gate/qwen3_moe_30b_a3b_instruct_2507/"
+            "c4/2048/moe-gate.json"
+        ),
     },
 }
 

@@ -95,6 +95,48 @@ We explore the automated design of mixed-precision quantization scheme for MoE m
 
 ⚠️ The profile step is a little bit time consuming. We expect to upload our previously calculated quant loss statistics and kernel profile data soon, allowing you to skip this step.
 
+## Qwen3-30B-A3B-Instruct-2507 fake-quant workflow
+
+The comparison path is self-contained in this repository. It does not import or
+modify GEMQ at runtime. Copy GEMQ's calibration JSON to:
+
+```text
+data/c4-train.00000-of-01024.json
+```
+
+Then run the stages separately (recommended for resumability), or use
+`run_all.sh`:
+
+```bash
+bash scripts/Qwen3-30B-A3B-Instruct-2507/trace.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/collect_loss.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
+```
+
+Defaults are C4, 128 sequences, sequence length 2048, seed 0, W1/W2/W3 G128
+expert candidates, a 2.0 nominal expert average (2.25 in MxMoE's metadata-aware
+budget), and W4 attention/dense FFNs. The output is a standard BF16 Hugging Face
+checkpoint containing dequantized approximate weights.
+
+To serve it using an unchanged GEMQ checkout:
+
+```bash
+MODEL_VARIANT=FQ FQ_MODEL_PATH=/path/to/mxmoe/checkpoint \
+  bash ../GEMQ/scripts/Qwen3-30B-A3B-Instruct-2507/serve_vllm.sh
+```
+
+The bundled performance model has no W1/W3 kernels or measurements. Therefore
+the Qwen3 W1/W2/W3 solver requires `--r 1.0`; a full accuracy/performance
+co-design claim requires real W1/W3 profiles on the target GPU.
+
+For an allocation-only comparison, keep both runs on the same model revision,
+tokenizer, C4 file, sample count/length/seed, BF16 dtype, eager attention, and
+plain GPTQ settings (G128, block size 128, percdamp 0.01, MSE enabled,
+act-order/static-groups disabled). GEMQ router fine-tuning and zero-bit expert
+pruning are additional techniques, so disable them when the experiment is
+intended to isolate GEMQ versus MxMoE bit allocation.
+
 
 
 ## 😺 Citation

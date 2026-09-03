@@ -11,6 +11,7 @@ ID2NAME = {
     # "qwen2_moe": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen1.5-MoE-A2.7B/snapshots/1a758c50ecb6350748b9ce0a99d2352fd9fc11c9",
     "qwen2_moe": "/root/workspace/models/Qwen1.5-MoE-A2.7B",
     "qwen2_moe_57b": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen2-57B-A14B-Instruct/snapshots/50896d66b39f1425d63720541a66c7df13e053c0",
+    "qwen3_moe_30b_a3b_instruct_2507": "Qwen/Qwen3-30B-A3B-Instruct-2507",
 }
 
 EXPERT_QUANT_LOSS = {
@@ -36,7 +37,10 @@ EXPERT_QUANT_LOSS = {
                 "w2a16_g128_asym": f"{CALIB_DIR}/{k}/{k}-MOE-rtn-W2A16_g128_asym-wiki2-128-4096-layer_out_norm.json",
                 "w1a16_g128_asym": f"{CALIB_DIR}/{k}/{k}-MOE-rtn-W1A16_g128_asym-wiki2-128-4096-layer_out_norm.json",
             }
-            for k in ["qwen2_moe", "mixtral", "qwen2_moe_57b", "ds2"]
+            for k in [
+                "qwen2_moe", "mixtral", "qwen2_moe_57b", "ds2",
+                "qwen3_moe_30b_a3b_instruct_2507",
+            ]
         },
     },
     "gptq": {
@@ -45,6 +49,11 @@ EXPERT_QUANT_LOSS = {
             "w4a16_g128_asym": f"{CALIB_DIR}/qwen2_moe/qwen2_moe-MOE-gptq-W4A16_g128_asym-wiki2-128-4096-model_out_norm.json",
             "w3a16_g128_asym": f"{CALIB_DIR}/qwen2_moe/qwen2_moe-MOE-gptq-W3A16_g128_asym-wiki2-128-4096-model_out_norm.json",
             "w2a16_g128_asym": f"{CALIB_DIR}/qwen2_moe/qwen2_moe-MOE-gptq-W2A16_g128_asym-wiki2-128-4096-model_out_norm.json",
+        },
+        "qwen3_moe_30b_a3b_instruct_2507": {
+            "w3a16_g128_asym": f"{CALIB_DIR}/qwen3_moe_30b_a3b_instruct_2507/qwen3_moe_30b_a3b_instruct_2507-MOE-gptq-W3A16_g128_asym-c4-128-2048-layer_out_norm.json",
+            "w2a16_g128_asym": f"{CALIB_DIR}/qwen3_moe_30b_a3b_instruct_2507/qwen3_moe_30b_a3b_instruct_2507-MOE-gptq-W2A16_g128_asym-c4-128-2048-layer_out_norm.json",
+            "w1a16_g128_asym": f"{CALIB_DIR}/qwen3_moe_30b_a3b_instruct_2507/qwen3_moe_30b_a3b_instruct_2507-MOE-gptq-W1A16_g128_asym-c4-128-2048-layer_out_norm.json",
         },
     },
     "gptq-had": {
@@ -60,7 +69,10 @@ EXPERT_QUANT_LOSS = {
                 "w2a16_g128_asym": f"{CALIB_DIR}/{k}/{k}-MOE-gptq-had-W2A16_g128_asym-wiki2-128-4096-layer_out_norm.json",
                 "w1a16_g128_asym": f"{CALIB_DIR}/{k}/{k}-MOE-gptq-had-W1A16_g128_asym-wiki2-128-4096-layer_out_norm.json",
             }
-            for k in ["qwen2_moe", "mixtral", "qwen2_moe_57b", "ds2"]
+            for k in [
+                "qwen2_moe", "mixtral", "qwen2_moe_57b", "ds2",
+                "qwen3_moe_30b_a3b_instruct_2507",
+            ]
         },
     },
     "rtn-fisher": {

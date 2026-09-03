@@ -642,6 +642,9 @@ def get_num_weights(model_id: str, num_layers: int):
         return num_layers * 8 * 3, 8 * 3
     elif model_id == "ds2":
         return num_layers * (64+2) * 3, (64+2) * 3
+    elif model_id == "qwen3_moe_30b_a3b_instruct_2507":
+        return num_layers * 128 * 3, 128 * 3
+    raise ValueError(f"Unsupported model for bit budgeting: {model_id}")
 
 
 def get_offline_stats(model_id: str, trace_file: str, perf_file: str):
@@ -657,7 +660,18 @@ def get_offline_stats(model_id: str, trace_file: str, perf_file: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model", type=str, default="qwen2_moe", choices=["qwen2_moe", "ds2", "mixtral", "qwen2_moe_57b"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="qwen3_moe_30b_a3b_instruct_2507",
+        choices=[
+            "qwen2_moe",
+            "ds2",
+            "mixtral",
+            "qwen2_moe_57b",
+            "qwen3_moe_30b_a3b_instruct_2507",
+        ],
+    )
     parser.add_argument("--qtype", type=str, choices=["rtn", "gptq", "gptq-had", "rtn-fisher", "gptq-fisher"], default="rtn")
     parser.add_argument("--batch", type=int, default=512, help="Batch size range for the model(input length).")
     parser.add_argument("--wbits", type=float, help="Averaged wbits budget for each parameter in the model.")
@@ -682,7 +696,10 @@ if __name__ == "__main__":
     batch_range = args.batch
     solve_mode = args.solve_mode
     if args.trace_file is None:
-        args.trace_file = f"{CUR_DIR}/calib/gate/{model_id}/wiki2/4096/moe-gate.json"
+        if model_id == "qwen3_moe_30b_a3b_instruct_2507":
+            args.trace_file = f"{CUR_DIR}/calib/gate/{model_id}/c4/2048/moe-gate.json"
+        else:
+            args.trace_file = f"{CUR_DIR}/calib/gate/{model_id}/wiki2/4096/moe-gate.json"
 
     print(args)
     ############################################################################
@@ -709,6 +726,17 @@ if __name__ == "__main__":
     ]
     if len(args.filter_list) != 0:
         filter_list = args.filter_list
+
+    if (
+        model_id == "qwen3_moe_30b_a3b_instruct_2507"
+        and args.r != 1.0
+        and any(name.startswith(("w1", "w3")) for name in filter_list)
+    ):
+        raise ValueError(
+            "Qwen3 W1/W3 performance profiles and kernels are not present in "
+            "this repository. Use --r 1.0 for the accuracy-only allocation, "
+            "or add measured W1/W3 profiles before enabling co-design."
+        )
 
     offline_stats = get_offline_stats(model_id, args.trace_file, args.perf_file)
     strategy_loss = get_strategy_loss(calib_loss_list, filter_list, qtype)

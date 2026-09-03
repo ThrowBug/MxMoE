@@ -19,8 +19,11 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
 )
-from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
-from mxmoe.quant.data_utils import get_wikitext2, get_humaneval_x
+from mxmoe.quant.data_utils import (
+    get_wikitext2,
+    get_humaneval_x,
+    get_calibration_samples,
+)
 from mxmoe.quant.moe_utils import get_expert_linears
 from project_config import *
 
@@ -37,6 +40,7 @@ class MoETracer:
             "deepseek_v2",
             "mixtral",
             "qwen2_moe",
+            "qwen3_moe",
         ], "Unsupported model architecture."
 
         if self.model_config.model_type == "deepseek_v2":
@@ -54,6 +58,14 @@ class MoETracer:
             self.num_experts = self.model_config.num_experts  # (shared experts not counted)
             self.percentile_stats: list[dict] = [{i: {} for i in [1, 4, 8, 15, 30, 45]} for _ in range(self.num_layers)]
             self.num_shared_experts = model.config.shared_expert_intermediate_size / model.config.moe_intermediate_size
+        elif self.model_config.model_type == "qwen3_moe":
+            self.N = self.model_config.moe_intermediate_size
+            self.num_experts = self.model_config.num_experts
+            self.percentile_stats = [
+                {i: {} for i in [1, 8, 16, 32, 64, 96]}
+                for _ in range(self.num_layers)
+            ]
+            self.num_shared_experts = 0
 
         self.experts = get_expert_linears(self.model, exclude_non_moe_layer=False)
 
@@ -113,14 +125,14 @@ class MoETracer:
                     topk_weight=self.topk_weight[layer_idx],
                 )
                 self.gate_hook_handle.append(moe_gate.register_forward_hook(moe_gate_hook))
-            elif self.model_config.model_type == "qwen2_moe":
-                moe: Qwen2MoeSparseMoeBlock = layer.mlp
+            elif self.model_config.model_type in ["qwen2_moe", "qwen3_moe"]:
+                moe: nn.Module = layer.mlp
                 moe_gate: nn.Module = moe.gate
 
                 moe_gate_hook = partial(
                     MoETracer.mixtral_gate_hook,
                     top_k=self.topk,
-                    norm_topk_prob=self.model_config.norm_topk_prob,
+                    norm_topk_prob=getattr(self.model_config, "norm_topk_prob", False),
                     topk_idx=self.topk_idx[layer_idx],
                     topk_weight=self.topk_weight[layer_idx],
                 )
@@ -205,6 +217,10 @@ class MoETracer:
                 }
             )
 
+        calibration_metadata = getattr(self, "calibration_metadata", None)
+        if calibration_metadata is not None:
+            data["calibration"] = calibration_metadata
+
         with open(path, "w") as f:
             options = jsbeautifier.default_options()
             options.indent_size = 2
@@ -226,11 +242,17 @@ class MoETracer:
             self.percentile_stats: list[dict] = [{i: {} for i in [1, 2, 4, 6]} for _ in range(self.num_layers)]
         elif self.model_config.model_type == "qwen2_moe":
             self.percentile_stats: list[dict] = [{i: {} for i in [1, 4, 8, 15, 30, 45]} for _ in range(self.num_layers)]
+        elif self.model_config.model_type == "qwen3_moe":
+            self.percentile_stats = [
+                {i: {} for i in [1, 8, 16, 32, 64, 96]}
+                for _ in range(self.num_layers)
+            ]
 
-    def set_input(self, input_samples: list[Tensor]):
+    def set_input(self, input_samples: list[Tensor], calibration_metadata: dict=None):
         # [1, seqlen]
         self.input_samples = input_samples
         self.num_tokens = input_samples[0].shape[1]
+        self.calibration_metadata = calibration_metadata
 
     @torch.no_grad()
     def collect_gate_score(self, path: str, layer_idx=-1):
@@ -445,19 +467,31 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="ds2", help="Model ID")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="qwen3_moe_30b_a3b_instruct_2507",
+        help="Model ID",
+    )
     parser.add_argument("--layer", type=int, default=10, help="Layer index.")
-    parser.add_argument("--dataset", type=str, default="wiki2", choices=["wiki2", "humaneval-x"], help="Sample dataset")
-    parser.add_argument("--seqlen", type=int, default=4096, help="Input length")
-    parser.add_argument("--nsamples", type=int, default=32, help="Number of samples")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--calib_dataset", type=str, default="c4", choices=["c4"], help="Calibration dataset")
+    parser.add_argument("--seqlen", type=int, default=2048, help="Input length")
+    parser.add_argument("--nsamples", type=int, default=128, help="Number of samples")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--attn_impl",
+        type=str,
+        default="eager",
+        choices=["eager", "sdpa"],
+        help="Attention implementation; use eager to match GEMQ's default recipe.",
+    )
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--trace_input", action="store_true", help="Trace activation")
     group.add_argument("--trace_gate", action="store_true", help="Trace MoE Gate(get freq and weight)")
 
     args = parser.parse_args()
-    dataset = args.dataset
+    dataset = args.calib_dataset
     model_id = args.model
     seqlen = args.seqlen
     nsamples = args.nsamples
@@ -467,22 +501,29 @@ if __name__ == "__main__":
     ############################################################################
     figure_path = f"{CUR_DIR}/figure"
     model_name = ID2NAME[model_id]
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        use_fast=True,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_impl,
         device_map="auto",
     )
+    model.eval()
+    model.seqlen = seqlen
     ############################################################################
     tracer = MoETracer(model)
-    if dataset == "wiki2":
-        trainloader, _ = get_wikitext2(nsamples, seed, seqlen, tokenizer, model_id)
-    elif dataset == "humaneval-x":
-        trainloader, _ = get_humaneval_x(nsamples, seed, seqlen, tokenizer, model_id)
-    else:
-        raise ValueError(f"Unsupported dataset `{dataset}`.")
+    trainloader, calibration_metadata = get_calibration_samples(
+        tokenizer,
+        calib_dataset=dataset,
+        nsamples=nsamples,
+        seqlen=seqlen,
+        seed=seed,
+    )
 
     if args.trace_input:
         # tracer.plot_tensor_distribution(f"{figure_path}/weights/{model_id}", tracer.get_mlp_weights(1))
@@ -494,7 +535,7 @@ if __name__ == "__main__":
     if args.trace_gate:
         print("Tracing MoE Gate ...")
         # for inp_len in tqdm([16, 32, 64, 128, 256, 512, 1024, 2048, 4096]):
-        for inp_len in tqdm([4096]):
+        for inp_len in tqdm([seqlen]):
             inps: list[Tensor] = [x[:, :inp_len] for x in trainloader[:nsamples]]
             # print(inp)
             out_dir = f"{CUR_DIR}/calib/gate/{model_id}/{dataset}/{inp_len}"
@@ -502,7 +543,7 @@ if __name__ == "__main__":
                 os.makedirs(out_dir)
 
             plot_layer = target_layer
-            tracer.set_input(inps)
+            tracer.set_input(inps, calibration_metadata=calibration_metadata)
             tracer.collect_gate_score(f"{out_dir}/moe-gate.json")
             tracer.plot_gate_score_layer(f"{out_dir}/layer-{plot_layer}", plot_layer)
             tracer.plot_gate_score_all(f"{out_dir}/heatmap")

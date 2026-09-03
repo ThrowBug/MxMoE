@@ -1,10 +1,190 @@
+import hashlib
+import itertools
 import os
 import random
 import pickle
+from pathlib import Path
+
+import numpy as np
+import torch
 from datasets import load_dataset
-from transformers import PreTrainedTokenizer, AutoTokenizer, PreTrainedModel
+from torch.utils.data import DataLoader
+import transformers
+from transformers import (
+    PreTrainedTokenizer,
+    AutoTokenizer,
+    PreTrainedModel,
+    default_data_collator,
+)
+from transformers.testing_utils import CaptureLogger
 
 from project_config import *
+
+
+MXMOE_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_C4_PATH = MXMOE_ROOT / "data" / "c4-train.00000-of-01024.json"
+
+
+def set_seed(seed: int):
+    """Match GEMQ's calibration seeding behavior."""
+    np.random.seed(seed)
+    torch.random.manual_seed(seed)
+
+
+def build_calib_loader(
+    dataset: str,
+    tokenizer: PreTrainedTokenizer,
+    max_block_size: int,
+    n_blocks_for_stat: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int = 41,
+):
+    """Build calibration blocks with the same C4 pipeline used by GEMQ.
+
+    The source code is intentionally kept local to MxMoE so the repository has
+    no runtime dependency on GEMQ.  The C4 JSON file is expected under
+    ``MxMoE/data`` when no explicit path is added in the future.
+    """
+    if dataset != "c4":
+        raise NotImplementedError(
+            f"Calibration dataset {dataset!r} is not supported by the shared GEMQ-style loader."
+        )
+    if not DEFAULT_C4_PATH.is_file():
+        raise FileNotFoundError(
+            "C4 calibration file not found. Copy GEMQ/data/"
+            f"c4-train.00000-of-01024.json to {DEFAULT_C4_PATH}."
+        )
+
+    all_set = load_dataset("json", data_files={"train": str(DEFAULT_C4_PATH)})
+
+    block_size = tokenizer.model_max_length
+    if block_size > max_block_size:
+        print(
+            "The chosen tokenizer supports a model_max_length longer than "
+            f"max_block_size={max_block_size}; using max_block_size."
+        )
+        block_size = max_block_size
+
+    if n_blocks_for_stat > 0:
+        calib_set = all_set["train"].shuffle(seed=seed).select(
+            range(min(n_blocks_for_stat * 16, len(all_set["train"])))
+        )
+    else:
+        print("n_blocks_for_stat <= 0, using the whole dataset.")
+        calib_set = all_set["train"].shuffle(seed=seed)
+
+    text_column_name = (
+        "text" if "text" in calib_set.features else list(calib_set.features)[0]
+    )
+    tok_logger = transformers.utils.logging.get_logger(
+        "transformers.tokenization_utils_base"
+    )
+
+    def tokenize_function(examples):
+        with CaptureLogger(tok_logger) as captured:
+            output = tokenizer(examples[text_column_name])
+        if "Token indices sequence length is longer than the" in captured.out:
+            tok_logger.warning(
+                "The long calibration examples will be chunked into fixed-size blocks."
+            )
+        return output
+
+    tokenized_calib_set = calib_set.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=list(calib_set.features),
+    )
+
+    def group_texts(examples):
+        concatenated_examples = {
+            key: list(itertools.chain(*examples[key])) for key in examples.keys()
+        }
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        result = {
+            key: [
+                values[i : i + block_size]
+                for i in range(0, total_length, block_size)
+            ]
+            for key, values in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    lm_calib_set = tokenized_calib_set.map(group_texts, batched=True)
+    if n_blocks_for_stat > 0:
+        if len(lm_calib_set) <= n_blocks_for_stat:
+            raise ValueError(
+                f"C4 produced only {len(lm_calib_set)} blocks, but "
+                f"{n_blocks_for_stat} are required."
+            )
+        lm_calib_set = lm_calib_set.select(range(n_blocks_for_stat))
+
+    return DataLoader(
+        lm_calib_set,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+        shuffle=False,
+        collate_fn=default_data_collator,
+    )
+
+
+def calibration_input_ids_sha256(samples: list[torch.Tensor]) -> str:
+    """Hash calibration token IDs independently of their in-memory dtype."""
+    digest = hashlib.sha256()
+    for sample in samples:
+        normalized = sample.detach().to(device="cpu", dtype=torch.int64).contiguous()
+        digest.update(normalized.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def get_calibration_samples(
+    tokenizer: PreTrainedTokenizer,
+    calib_dataset: str = "c4",
+    nsamples: int = 128,
+    seqlen: int = 2048,
+    seed: int = 0,
+    batch_size: int = 1,
+    num_workers: int = 4,
+) -> tuple[list[torch.Tensor], dict]:
+    """Return one ``(1, seqlen)`` tensor per calibration sample.
+
+    Keeping this normalized representation prevents the GPTQ and routing-stat
+    paths from interpreting DataLoader batches differently.
+    """
+    if calib_dataset != "c4":
+        raise NotImplementedError(
+            "Only calib_dataset='c4' is enabled for the Qwen3 comparison."
+        )
+    loader = build_calib_loader(
+        calib_dataset,
+        tokenizer,
+        seqlen,
+        nsamples,
+        batch_size,
+        num_workers,
+        seed=seed,
+    )
+    samples = []
+    for batch in loader:
+        for row in batch["input_ids"]:
+            samples.append(row.unsqueeze(0))
+    samples = samples[:nsamples]
+    if len(samples) != nsamples:
+        raise ValueError(f"Expected {nsamples} calibration blocks, got {len(samples)}.")
+    metadata = {
+        "dataset": calib_dataset,
+        "source": str(DEFAULT_C4_PATH),
+        "nsamples": nsamples,
+        "seqlen": seqlen,
+        "seed": seed,
+        "input_ids_sha256": calibration_input_ids_sha256(samples),
+    }
+    return samples, metadata
 
 # def get_tokenizer(model: PreTrainedModel):
 #     tokenizer = AutoTokenizer.from_pretrained(model)

@@ -17,11 +17,11 @@ from transformers import PreTrainedModel, AutoTokenizer, AutoModelForCausalLM
 from typing import Literal
 from mxmoe.quant.evaluator import Evaluator
 
-from mxmoe.quant.gptq import GPTQ
-from mxmoe.quant.gptq import Quantizer as GPTQuantizer
-from mxmoe.quant.data_utils import get_wikitext2
+from mxmoe.quant.gemq_gptq import GPTQWeightQuantizer
+from mxmoe.quant.data_utils import get_wikitext2, get_calibration_samples
 from mxmoe.quant.moe_utils import (
     get_expert_linears,
+    get_attn_linears,
     get_linears_in_one_expert, get_linear_block_weight,
     recover_weight_from_cpu,
     substitue_moe_weights, offload_moe_weights,
@@ -169,19 +169,21 @@ def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
         def __init__(self, module):
             super().__init__()
             self.module = module
+            if hasattr(module, "attention_type"):
+                self.attention_type = module.attention_type
 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.to(dev)
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            cache['position_embeddings'] = kwargs['position_embeddings']
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
 
     layers[0] = Catcher(layers[0])
     for batch in tqdm(dataloader, desc="Preparing inputs"):
         try:
-            model(batch.to(model.device))
+            model(batch.to(dev))
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -236,6 +238,11 @@ class MoeModelQuantizer:
         pre_quantized_weight=None, # pre-quantized weight path, used for time-consuming quantization(GPTQ, GPTQ-HAD)
         ori_wcfg:tuple[int,int]=(16,-1), # original weight bitwidth and group size
         online_had:bool=False,
+        gptq_dataloader=None,
+        calib_dataset: str = "c4",
+        gptq_seed: int = 0,
+        gptq_seqlen: int = 2048,
+        prepare_gptq_state: bool = True,
     ):
         self.model_id = model_id
         self.ori_model = model
@@ -245,7 +252,7 @@ class MoeModelQuantizer:
         self.hidden_size: int = self.model_config.hidden_size
         self.dtype = next(iter(model.parameters())).dtype
 
-        assert self.model_type in ["deepseek_v2", "mixtral", "qwen2_moe"], f"Unsupported model type: {self.model_type}"
+        assert self.model_type in ["deepseek_v2", "mixtral", "qwen2_moe", "qwen3_moe"], f"Unsupported model type: {self.model_type}"
 
         self.qmethod: QMethod = qmethod
 
@@ -272,8 +279,24 @@ class MoeModelQuantizer:
                 logger.info(f">>> Enable Online GPTQ weight quantization, may be time-consuming ...")
                 from mxmoe.quant.moe_utils import load_tokenizer
                 self.gptq_nsamples = gptq_nsamples
-                trainloader, _ = get_wikitext2(self.gptq_nsamples, 42, 4096, load_tokenizer(model_id), self.model_id, False)
-                self.gptq_layer_state, self.gptq_attention_mask, self.gptq_position_ids, self.gptq_pos_emb = prepare_inps(self.ori_model, trainloader)
+                if gptq_dataloader is None:
+                    trainloader, _ = get_calibration_samples(
+                        load_tokenizer(model_id),
+                        calib_dataset=calib_dataset,
+                        nsamples=self.gptq_nsamples,
+                        seqlen=gptq_seqlen,
+                        seed=gptq_seed,
+                    )
+                else:
+                    trainloader = gptq_dataloader
+                    self.gptq_nsamples = len(trainloader)
+                if prepare_gptq_state:
+                    (
+                        self.gptq_layer_state,
+                        self.gptq_attention_mask,
+                        self.gptq_position_ids,
+                        self.gptq_pos_emb,
+                    ) = prepare_inps(self.ori_model, trainloader)
                 self.gptq_percdamp = 0.01
 
                 logger.info(f"Calibrating GPTQ with {self.gptq_nsamples} samples ...")
@@ -383,7 +406,16 @@ class MoeModelQuantizer:
 
 
     @torch.no_grad()
-    def quant_model_weight_layer(self, model: PreTrainedModel, layer_idx: int, moe_qconfig: QLayerConfig, attn_qconfig: QLinearConfig=None):
+    def quant_model_weight_layer(
+        self,
+        model: PreTrainedModel,
+        layer_idx: int,
+        moe_qconfig: QLayerConfig,
+        attn_qconfig: QLinearConfig=None,
+        gptq_layer_inputs: Tensor=None,
+        gptq_layer_kwargs: dict=None,
+        advance_gptq_state: bool=True,
+    ):
         '''
         moe_qconfig: [layer_idx, expert_idx]
             
@@ -424,6 +456,89 @@ class MoeModelQuantizer:
             cur_layer = model.model.layers[layer_i]
 
             layer_experts = get_expert_linears(model, layer_idx=layer_i, exclude_non_moe_layer=False)
+            if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
+                selected_linears = {}
+                for expert_idx, expert in enumerate(layer_experts):
+                    qmap = moe_qconfig.experts[str(expert_idx)].qmap()
+                    for linear_block, module in get_linears_in_one_expert(expert).items():
+                        cfg = qmap[linear_block]
+                        if cfg.w_bits < 16:
+                            selected_linears[f"expert-{expert_idx}.{linear_block}"] = (module, cfg)
+
+                if attn_qconfig is not None and attn_qconfig.w_bits < 16:
+                    for name, module in get_attn_linears(model, layer_idx=layer_i).items():
+                        selected_linears[f"attention.{name}"] = (module, attn_qconfig)
+
+                gptq_items = {}
+                handles = []
+
+                def make_hook(gptq_obj):
+                    def hook(_module, inputs, _output):
+                        gptq_obj.add_batch(inputs[0].detach())
+                    return hook
+
+                for name, (module, cfg) in selected_linears.items():
+                    groupsize = cfg.w_gsize
+                    if groupsize > 0 and module.weight.shape[1] % groupsize != 0:
+                        if module.weight.shape[1] % 64 != 0:
+                            raise ValueError(
+                                f"Cannot apply G{groupsize} or G64 to {name} with "
+                                f"input dimension {module.weight.shape[1]}."
+                            )
+                        groupsize = 64
+                    gptq = GPTQWeightQuantizer(
+                        module.weight.data,
+                        name=f"model.layers.{layer_i}.{name}",
+                        nbits=cfg.w_bits,
+                        blocksize=128,
+                        percdamp=self.gptq_percdamp,
+                        groupsize=groupsize,
+                        actorder=False,
+                        static_groups=False,
+                        mse=True,
+                    )
+                    gptq_items[name] = (module, gptq)
+                    handles.append(module.register_forward_hook(make_hook(gptq)))
+
+                fixed_inputs = (
+                    gptq_layer_inputs
+                    if gptq_layer_inputs is not None
+                    else self.gptq_layer_state
+                )
+                layer_kwargs = gptq_layer_kwargs or {
+                    "attention_mask": self.gptq_attention_mask,
+                    "position_ids": self.gptq_position_ids,
+                    "position_embeddings": self.gptq_pos_emb,
+                }
+                try:
+                    # Every hook observes the same X_l. Never write these outputs
+                    # back into fixed_inputs while collecting Hessians.
+                    for sample_idx in range(fixed_inputs.shape[0]):
+                        cur_layer(
+                            fixed_inputs[sample_idx].unsqueeze(0),
+                            **layer_kwargs,
+                        )
+                finally:
+                    for handle in handles:
+                        handle.remove()
+
+                for name, (module, gptq) in gptq_items.items():
+                    print(f"Quantizing layer-{layer_i} {name} with GPTQ ...")
+                    qweight, scales, zeros = gptq.quantize()
+                    module.weight.data = gptq.dequantize(
+                        qweight, scales, zeros
+                    ).reshape_as(module.weight.data)
+
+                if advance_gptq_state:
+                    next_inputs = torch.empty_like(fixed_inputs)
+                    for sample_idx in range(fixed_inputs.shape[0]):
+                        next_inputs[sample_idx] = cur_layer(
+                            fixed_inputs[sample_idx].unsqueeze(0),
+                            **layer_kwargs,
+                        )[0]
+                    self.gptq_layer_state = next_inputs
+                continue
+
             # 1. quantize the weights of moe layer
             for expert_idx, expert in enumerate(layer_experts):
                 qmap = moe_qconfig.experts[str(expert_idx)].qmap()
@@ -432,30 +547,6 @@ class MoeModelQuantizer:
                 for linear_block, m in weights_in_expert.items():
                     cfg = qmap[linear_block]
                     if cfg.w_bits >= 16: continue
-                    # GPTQ
-                    if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
-                        print(f"Quantizing layer-{layer_i} expert-{expert_idx} block-{linear_block} with GPTQ ...")
-                        gptq = GPTQ(m)
-                        gptq.quantizer = GPTQuantizer()
-                        gptq.quantizer.configure(
-                            cfg.w_bits, perchannel=True, sym=cfg.w_sym, mse=False
-                        )
-                        handle: torch.utils.hooks.RemovableHandle = []
-                        handle = m.register_forward_hook(lambda _, inp, out: gptq.add_batch(inp[0].data, out.data))
-                        # if self.gptq_attention_mask
-                        for j in range(self.gptq_nsamples):
-                            self.gptq_layer_state[j] = cur_layer(
-                                self.gptq_layer_state[j].unsqueeze(0),
-                                attention_mask=self.gptq_attention_mask,
-                                position_ids=self.gptq_position_ids,
-                                position_embeddings=self.gptq_pos_emb,
-                            )[0]
-                        handle.remove()
-                        gptq.fasterquant(
-                            percdamp=self.gptq_percdamp, groupsize=cfg.w_gsize, actorder=True, static_groups=True
-                        )
-                        gptq.free()
-                        continue
                     # RTN
                     quantizer = Quantizer(cfg.w_bits, cfg.w_sym, cfg.w_gsize, cfg.w_clip)
                     m.weight.data = quantizer.fake_quant(m.weight.data)
@@ -523,7 +614,11 @@ class MoeModelQuantizer:
         attn_bits_alloc: QLinearConfig=None,
     ) -> list[list[float]] | list[float]:
         ori_dev = self.ori_model.device
-        if self.model_id in ["qwen2_moe_57b", "mixtral"]: assert ori_dev.type == "cpu"
+        if self.model_id in [
+            "qwen2_moe_57b",
+            "mixtral",
+            "qwen3_moe_30b_a3b_instruct_2507",
+        ]: assert ori_dev.type == "cpu"
         else: assert "cuda" in ori_dev.type
 
         assert self.quantized_model is None, "Quantized model should not be initialized"
@@ -544,8 +639,8 @@ class MoeModelQuantizer:
             dev = torch.device("cuda:0")
 
             inps, attn_mask, position_ids, pos_emb = prepare_inps(self.ori_model, dataloader)
-            full_precision_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
-            quantized_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
+            full_precision_outs: Tensor = torch.zeros_like(inps, dtype=torch.float32)
+            quantized_outs: Tensor = torch.zeros_like(inps, dtype=torch.float32)
 
             for layer_idx in tqdm(range(len(layers))):
                 self.ori_model.model.layers[layer_idx] = layers[layer_idx].to(dev)
@@ -561,7 +656,7 @@ class MoeModelQuantizer:
                             attention_mask=attn_mask,
                             position_ids=position_ids,
                             position_embeddings=pos_emb,
-                        )[0].to(torch.float64)
+                        )[0].to(torch.float32)
 
                 # 2. get the output of the quantized layer
                 num_layer_experts = len(get_expert_linears(self.ori_model, layer_idx, exclude_non_moe_layer=False))
@@ -575,7 +670,19 @@ class MoeModelQuantizer:
                             if self.pre_quantized_weight is not None:
                                 substitue_moe_weights(self.model_id, self.ori_model, self.pre_quantized_weight, layer_idx, exp_id, qlinear_block)
                             else:
-                                self.quant_model_weight_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
+                                self.quant_model_weight_layer(
+                                    self.ori_model,
+                                    layer_idx,
+                                    qlayer_cfg,
+                                    attn_bits_alloc,
+                                    gptq_layer_inputs=inps,
+                                    gptq_layer_kwargs={
+                                        "attention_mask": attn_mask,
+                                        "position_ids": position_ids,
+                                        "position_embeddings": pos_emb,
+                                    },
+                                    advance_gptq_state=False,
+                                )
                             self.plug_act_quant_hook_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
                             for i in range(num_samples):
                                 quantized_outs[i] = layer(
@@ -583,7 +690,7 @@ class MoeModelQuantizer:
                                     attention_mask=attn_mask,
                                     position_ids=position_ids,
                                     position_embeddings=pos_emb,
-                                )[0].to(torch.float64)
+                                )[0].to(torch.float32)
                             # 3. calculate the quantization error
                             # quant_err = F.mse_loss(quantized_outs, full_precision_outs).item()
                             quant_err = torch.norm(quantized_outs-full_precision_outs).item()
@@ -609,9 +716,22 @@ class MoeModelQuantizer:
 
 
                 # 6. prepare the inputs for next layer
-                inps, full_precision_outs = full_precision_outs.to(inps.dtype), full_precision_outs
+                # Keep the next layer input separate from the FP32 output
+                # buffer.  Aliasing both names to ``full_precision_outs``
+                # makes the following layer overwrite its own input while it
+                # is still being consumed sample by sample.
+                inps = full_precision_outs.to(inps.dtype)
 
         elif metric == "model_out_norm":
+            if (
+                self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]
+                and self.pre_quantized_weight is None
+            ):
+                raise ValueError(
+                    "Online GPTQ model_out_norm calibration is unsupported because "
+                    "each target layer needs its own captured hidden states. Use "
+                    "layer_out_norm or provide pre-quantized weights."
+                )
             # inps: [num_samples, seqlen]
             inps = torch.vstack([d.to(ori_dev) for d in dataloader])
 
@@ -633,7 +753,14 @@ class MoeModelQuantizer:
                     for qlinear_block, qlayer_cfg in zip(["gate", "up", "down"], qlayer_cfgs):
                         ori_weight = get_linear_block_weight(self.model_id, self.ori_model, layer_idx, exp_id, qlinear_block).cpu()
                         self.preprocess_weight(self.ori_model, layer_idx, exp_idx=exp_id)
-                        self.quant_model_weight_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
+                        self.quant_model_weight_layer(
+                            self.ori_model,
+                            layer_idx,
+                            qlayer_cfg,
+                            attn_bits_alloc,
+                            gptq_layer_inputs=None,
+                            advance_gptq_state=False,
+                        )
                         self.plug_act_quant_hook_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
 
                         with torch.inference_mode():
@@ -728,7 +855,16 @@ if __name__ == "__main__":
     parser_calib.add_argument("--gran", type=str, choices=["expert", "linear"], default="linear", help="Granularity of estimation")
     parser_calib.add_argument("--online_had", action="store_true", help="Whether to use use Hadamard transform")
     parser_calib.add_argument("--nsamples", type=int, default=128, help="Number of samples for calibration")
-    parser_calib.add_argument("--seed", type=int, default=42, help="Random Seed.")
+    parser_calib.add_argument("--seqlen", type=int, default=2048, help="Calibration sequence length")
+    parser_calib.add_argument("--calib_dataset", type=str, default="c4", choices=["c4"], help="Calibration dataset")
+    parser_calib.add_argument("--seed", type=int, default=0, help="Random Seed.")
+    parser_calib.add_argument(
+        "--attn_impl",
+        type=str,
+        default="eager",
+        choices=["eager", "sdpa"],
+        help="Attention implementation; use eager to match GEMQ's default recipe.",
+    )
 
     args = parser.parse_args(
         # [
@@ -766,7 +902,11 @@ if __name__ == "__main__":
     qmethod = qtype_2_method[quant_type]
 
     model_name = ID2NAME[model_id]
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        use_fast=True,
+    )
 
     if quant_type in ["gptq-had", "rtn-had"]:
         qweight_map = {
@@ -794,18 +934,31 @@ if __name__ == "__main__":
         }
 
     ori_wcfg = (16,-1)
-    if model_id in ["qwen2_moe_57b", "mixtral"] and args.sub == "calib":
+    if model_id in [
+        "qwen2_moe_57b",
+        "mixtral",
+        "qwen3_moe_30b_a3b_instruct_2507",
+    ] and args.sub == "calib":
         print(f">>> load model to CPU")
         model_name = ID2NAME[model_id]
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            attn_implementation="flash_attention_2",
+            attn_implementation=(
+                args.attn_impl
+                if model_id == "qwen3_moe_30b_a3b_instruct_2507"
+                else "flash_attention_2"
+            ),
             trust_remote_code=True,
-            torch_dtype="auto",
+            torch_dtype=(
+                torch.bfloat16
+                if model_id == "qwen3_moe_30b_a3b_instruct_2507"
+                else "auto"
+            ),
             device_map="cpu",
         )
     else:
         model = load_hf_model(model_id)
+    model.eval()
     ############################################################################
 
     if args.sub == "eval":
@@ -894,12 +1047,18 @@ if __name__ == "__main__":
     ############################################################################
     if args.sub == "calib":
         nsamples = args.nsamples
-        seqlen = 4096
+        seqlen = args.seqlen
 
         ts = time.strftime('%m-%d-%H-%M', time.localtime(time.time()))
         logger = setup_logger("quant-calib", log_file=f"{CUR_DIR}/log/calib_qerror_{ts}.log")
 
-        trainloader, testloader = get_wikitext2(nsamples, 42, seqlen, tokenizer, model_id=model_id, test_only=False)
+        trainloader, calibration_metadata = get_calibration_samples(
+            tokenizer,
+            calib_dataset=args.calib_dataset,
+            nsamples=nsamples,
+            seqlen=seqlen,
+            seed=args.seed,
+        )
 
         uni_attn_weight_cfg = QLinearConfig(w_bits=16)
 
@@ -928,8 +1087,18 @@ if __name__ == "__main__":
         elif quant_type == "gptq":
             assert uni_qconfig.a_bits == 16
             pre_quantized_weight = args.qweight
-            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ, pre_quantized_weight=pre_quantized_weight)
-            save_path = f"{CUR_DIR}/calib/{model_id}-MOE-gptq-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
+            model_quantizer = MoeModelQuantizer(
+                model,
+                model_id,
+                QMethod.GPTQ,
+                pre_quantized_weight=pre_quantized_weight,
+                gptq_dataloader=trainloader,
+                calib_dataset=args.calib_dataset,
+                gptq_seed=args.seed,
+                gptq_seqlen=seqlen,
+                prepare_gptq_state=False,
+            )
+            save_path = f"{CUR_DIR}/calib/{model_id}/{model_id}-MOE-gptq-{uni_qconfig}-{args.calib_dataset}-{nsamples}-{seqlen}-{metric}.json"
         elif quant_type == "gptq-had":
             pre_quantized_weight = args.qweight
             model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ_HAD, pre_quantized_weight=pre_quantized_weight, online_had=args.online_had)
@@ -944,4 +1113,26 @@ if __name__ == "__main__":
             args.gran, save_path,
             uni_qconfig, uni_attn_weight_cfg,
         )
+        with open(f"{save_path}.metadata.json", "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "model": model_name,
+                    "calibration": calibration_metadata,
+                    "method": quant_type,
+                    "metric": metric,
+                    "granularity": args.gran,
+                    "qconfig": uni_qconfig.to_dict(),
+                    "gptq": {
+                        "groupsize": uni_qconfig.w_gsize,
+                        "blocksize": 128,
+                        "percdamp": 0.01,
+                        "mse": True,
+                        "actorder": False,
+                        "static_groups": False,
+                    },
+                },
+                stream,
+                ensure_ascii=False,
+                indent=2,
+            )
         # print(model_quant_loss)
