@@ -251,7 +251,10 @@ def solve_model_qconfig_layer_level(
 
         if r == 1:
             tile_cfgs: list[list[TileConfig]] = [[] for _ in range(1)]
-            runtime_cost: list[list[list[list[float]]]] = [[[[1.0 for _ in range(1)] for _ in range(S)] for _ in range(E)] for _ in range(E)]
+            runtime_cost: list[list[list[list[float]]]] = [
+                [[[1.0] for _ in range(S)] for _ in range(N)]
+                for _ in range(E)
+            ]
             num_tile_cfgs = len(runtime_cost[0][0][0])
         else:
             # y[e,n,s,t]: whether linear[n] in expert[e] is assigned to quant_strategy[s], using tile_cfgs[t]
@@ -287,21 +290,29 @@ def solve_model_qconfig_layer_level(
         if args.exp_alloc:
             # x[e,n,s] indicate whether weights[n] in experts[e] select strategy[s]
             x = model.addVars(E,S, vtype=gp.GRB.BINARY, name="x")
-            y = model.addVars(E,S,num_tile_cfgs, vtype=gp.GRB.BINARY, name="y")
             L = gp.quicksum(
                 x[e,s] * delta[e][s]
                 for e in range(E) for s in range(S)
             )
-            T = gp.quicksum(
-                x[e,s] * runtime_cost[e][s][t] * y[e,s,t]
-                for e in range(E) 
-                for s in range(S) 
-                for t in range(num_tile_cfgs)
-            )
-            model.setObjective(
-                L**r * T**(1-r),
-                sense=gp.GRB.MINIMIZE
-            )
+            if r == 1:
+                # Accuracy-only allocation does not use runtime or tile choices.
+                # Omitting y keeps Qwen3 below Gurobi's size-limited-license cap
+                # without changing min L or any bit-allocation constraint.
+                y = None
+                T = gp.LinExpr(float(E))
+                model.setObjective(L, sense=gp.GRB.MINIMIZE)
+            else:
+                y = model.addVars(E,S,num_tile_cfgs, vtype=gp.GRB.BINARY, name="y")
+                T = gp.quicksum(
+                    x[e,s] * runtime_cost[e][s][t] * y[e,s,t]
+                    for e in range(E)
+                    for s in range(S)
+                    for t in range(num_tile_cfgs)
+                )
+                model.setObjective(
+                    L**r * T**(1-r),
+                    sense=gp.GRB.MINIMIZE
+                )
             # constrain: memory budget
             model.addConstr(
                 gp.quicksum(
@@ -312,25 +323,30 @@ def solve_model_qconfig_layer_level(
             # constrain: one strategy for each weight matrix
             for e in range(E):
                 model.addConstr(gp.quicksum(x[e, s] for s in range(S)) == 1, name=f"1_strategy_for_E{e}")
-            # constrain: one tile config for each weight matrix
-            for e, n,s,t in itertools.product(range(E), range(N), range(S), range(num_tile_cfgs)):
-                model.addConstr(gp.quicksum(y[e,s,t] for t in range(num_tile_cfgs)) == 1, name=f"y_{e}_{s}_{t}")
+            if y is not None:
+                # constrain: one tile config for each weight matrix
+                for e, n,s,t in itertools.product(range(E), range(N), range(S), range(num_tile_cfgs)):
+                    model.addConstr(gp.quicksum(y[e,s,t] for t in range(num_tile_cfgs)) == 1, name=f"y_{e}_{s}_{t}")
         else:
             # x[e,n,s] indicate whether weights[n] in experts[e] select strategy[s]
             x = model.addVars(E, N, S, vtype=gp.GRB.BINARY, name="x")
-            y = model.addVars(E,N,S,num_tile_cfgs, vtype=gp.GRB.BINARY, name="y")
 
             L = gp.quicksum(
                 x[e, n, s] * delta[e][n][s]
                 for e in range(E) for n in range(N) for s in range(S)
             )
-            T = gp.quicksum(
-                x[e, n, s] * runtime_cost[e][n][s][t] * y[e,n,s,t]
-                for e in range(E) 
-                for n in range(N) 
-                for s in range(S) 
-                for t in range(num_tile_cfgs)
-            )
+            if r == 1:
+                y = None
+                T = gp.LinExpr(float(E * N))
+            else:
+                y = model.addVars(E,N,S,num_tile_cfgs, vtype=gp.GRB.BINARY, name="y")
+                T = gp.quicksum(
+                    x[e, n, s] * runtime_cost[e][n][s][t] * y[e,n,s,t]
+                    for e in range(E)
+                    for n in range(N)
+                    for s in range(S)
+                    for t in range(num_tile_cfgs)
+                )
 
             if not (r == 0.0 or r == 1):
                 epsilon = 1e-6
@@ -352,10 +368,13 @@ def solve_model_qconfig_layer_level(
                     sense=gp.GRB.MINIMIZE
                 )
             else:
-                model.setObjective(
-                    L**r * T**(1-r),
-                    sense=gp.GRB.MINIMIZE
-                )
+                if r == 1:
+                    model.setObjective(L, sense=gp.GRB.MINIMIZE)
+                else:
+                    model.setObjective(
+                        L**r * T**(1-r),
+                        sense=gp.GRB.MINIMIZE
+                    )
 
             # constrain: memory budget
             model.addConstr(
@@ -367,9 +386,10 @@ def solve_model_qconfig_layer_level(
             # constrain: one strategy for each weight matrix
             for e, n in itertools.product(range(E), range(N)):
                 model.addConstr(gp.quicksum(x[e, n, s] for s in range(S)) == 1, name=f"1_strategy_for_E{e}_W{n}")
-            # constrain: one tile config for each weight matrix
-            for e, n,s,t in itertools.product(range(E), range(N), range(S), range(num_tile_cfgs)):
-                model.addConstr(gp.quicksum(y[e,n,s,t] for t in range(num_tile_cfgs)) == 1, name=f"y_{e}_{n}_{s}_{t}")
+            if y is not None:
+                # constrain: one tile config for each weight matrix
+                for e, n,s,t in itertools.product(range(E), range(N), range(S), range(num_tile_cfgs)):
+                    model.addConstr(gp.quicksum(y[e,n,s,t] for t in range(num_tile_cfgs)) == 1, name=f"y_{e}_{n}_{s}_{t}")
             # for e, s_gate, s_up in itertools.product(range(E), range(S), range(S)):
             #     if strategy_abits[s_gate] != strategy_abits[s_up]:
             #         model.addConstr(x[e,0,s_gate] + x[e,1,s_up] <= 1, name=f"same_act_bits_for_gate_up_E{e}_S{s_gate}_S{s_up}")
@@ -394,20 +414,22 @@ def solve_model_qconfig_layer_level(
             obj_val = model.PoolObjVal
 
             selected_strategies = defaultdict(dict)
-            selected_tile_config = None
+            selected_tile_config = [] if y is None else None
             for e, n, s in itertools.product(range(E), range(N), range(S)):
                 if args.exp_alloc:
                     if x[e, s].X > 0.5:
                         selected_strategies[e][n] = strategies[s]
-                    for t in range(num_tile_cfgs):
-                        if y[e,s,t].X > 0.5:
-                            selected_tile_config = tile_cfgs[t]
+                    if y is not None:
+                        for t in range(num_tile_cfgs):
+                            if y[e,s,t].X > 0.5:
+                                selected_tile_config = tile_cfgs[t]
                 else:
                     if x[e, n, s].X > 0.5:
                         selected_strategies[e][n] = strategies[s]
-                    for t in range(num_tile_cfgs):
-                        if y[e,n,s,t].X > 0.5:
-                            selected_tile_config = tile_cfgs[t]
+                    if y is not None:
+                        for t in range(num_tile_cfgs):
+                            if y[e,n,s,t].X > 0.5:
+                                selected_tile_config = tile_cfgs[t]
 
             # print(f"        best_obj_val: {best_obj_val}, cur_distance: {obj_val - best_obj_val:.3f}")
             if i == 0:
