@@ -18,6 +18,7 @@ from typing import Literal
 from mxmoe.quant.evaluator import Evaluator
 
 from mxmoe.quant.gemq_gptq import GPTQWeightQuantizer
+from mxmoe.quant.artifact_utils import write_metadata
 from mxmoe.quant.data_utils import get_wikitext2, get_calibration_samples
 from mxmoe.quant.moe_utils import (
     get_expert_linears,
@@ -132,6 +133,11 @@ def mlp_inp_quant_hook(m: nn.Module, inp, quantizer: Quantizer):
 def smooth_act_quant_hook(m: nn.Module, inp:tuple, quantizer: Quantizer, smooth_scale: Tensor):
     return quantizer.fake_quant(inp[0].div(smooth_scale))
 
+
+class _StopForward(RuntimeError):
+    """Private control-flow exception used only by the input catcher."""
+
+
 @torch.no_grad()
 def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
     '''
@@ -178,29 +184,34 @@ def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
             cache['attention_mask'] = kwargs.get('attention_mask')
             cache['position_ids'] = kwargs.get('position_ids')
             cache['position_embeddings'] = kwargs.get('position_embeddings')
-            raise ValueError
+            raise _StopForward
 
     layers[0] = Catcher(layers[0])
-    for batch in tqdm(dataloader, desc="Preparing inputs"):
-        try:
-            model(batch.to(dev))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].to(ori_dev)
-    model.model.embed_tokens = model.model.embed_tokens.to(ori_dev)
-    # model.model.norm = model.model.norm.to(ori_dev)
-    if rotary_emb is not None:
-        model.model.rotary_emb = rotary_emb.to(ori_dev)
+    try:
+        for batch in tqdm(dataloader, desc="Preparing inputs"):
+            try:
+                model(batch.to(dev))
+            except _StopForward:
+                pass
+        if cache['i'] != num_samples:
+            raise RuntimeError(
+                f"Captured {cache['i']} decoder inputs, expected {num_samples}."
+            )
+    finally:
+        catcher = layers[0]
+        layers[0] = catcher.module if isinstance(catcher, Catcher) else catcher
+        layers[0] = layers[0].to(ori_dev)
+        model.model.embed_tokens = model.model.embed_tokens.to(ori_dev)
+        # model.model.norm = model.model.norm.to(ori_dev)
+        if rotary_emb is not None:
+            model.model.rotary_emb = rotary_emb.to(ori_dev)
+        model.config.use_cache = use_cache
 
     torch.cuda.empty_cache()
 
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
     position_embeddings = cache['position_embeddings']
-    model.config.use_cache = use_cache
-
     return inps, attention_mask, position_ids, position_embeddings
 
 
@@ -1113,26 +1124,23 @@ if __name__ == "__main__":
             args.gran, save_path,
             uni_qconfig, uni_attn_weight_cfg,
         )
-        with open(f"{save_path}.metadata.json", "w", encoding="utf-8") as stream:
-            json.dump(
-                {
-                    "model": model_name,
-                    "calibration": calibration_metadata,
-                    "method": quant_type,
-                    "metric": metric,
-                    "granularity": args.gran,
-                    "qconfig": uni_qconfig.to_dict(),
-                    "gptq": {
-                        "groupsize": uni_qconfig.w_gsize,
-                        "blocksize": 128,
-                        "percdamp": 0.01,
-                        "mse": True,
-                        "actorder": False,
-                        "static_groups": False,
-                    },
+        write_metadata(
+            save_path,
+            {
+                "model": model_name,
+                "calibration": calibration_metadata,
+                "method": quant_type,
+                "metric": metric,
+                "granularity": args.gran,
+                "qconfig": uni_qconfig.to_dict(),
+                "gptq": {
+                    "groupsize": uni_qconfig.w_gsize,
+                    "blocksize": 128,
+                    "percdamp": 0.01,
+                    "mse": True,
+                    "actorder": False,
+                    "static_groups": False,
                 },
-                stream,
-                ensure_ascii=False,
-                indent=2,
-            )
+            },
+        )
         # print(model_quant_loss)

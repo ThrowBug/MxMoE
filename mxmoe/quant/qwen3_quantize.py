@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import torch
@@ -9,6 +10,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from mxmoe.kernels.qconfig import build_qmodel_cfg_from_json
 from mxmoe.quant.data_utils import get_calibration_samples
+from mxmoe.quant.artifact_utils import (
+    load_optional_metadata,
+    validate_calibration_artifacts,
+)
 from mxmoe.quant.hf_save import save_fake_quant_checkpoint
 from mxmoe.quant.mixed_gptq import GPTQConfig, quantize_model_mixed_gptq
 
@@ -38,6 +43,11 @@ def parse_args():
     parser.add_argument("--attn_impl", default="eager", choices=["eager", "sdpa"])
     parser.add_argument("--max_shard_size", default="5GB")
     parser.add_argument("--trust_remote_code", action="store_true")
+    parser.add_argument(
+        "--allow_artifact_mismatch",
+        action="store_true",
+        help="Allow a qconfig sidecar that disagrees with this quantization run.",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +56,36 @@ def main():
     if not torch.cuda.is_available() or not args.device.startswith("cuda"):
         raise RuntimeError("Qwen3 GPTQ quantization requires a CUDA device.")
     set_seed(args.seed)
+
+    allocation_metadata = load_optional_metadata(
+        args.qconfig, artifact_name="allocation qconfig"
+    )
+    if allocation_metadata is not None:
+        try:
+            validate_calibration_artifacts(
+                [("allocation qconfig", allocation_metadata)],
+                {
+                    "dataset": args.calib_dataset,
+                    "nsamples": args.nsamples,
+                    "seqlen": args.seqlen,
+                    "seed": args.seed,
+                },
+            )
+            expected_model = allocation_metadata.get("model")
+            if expected_model is not None and expected_model != args.model:
+                raise ValueError(
+                    f"Allocation model mismatch: expected {expected_model!r}, "
+                    f"got {args.model!r}."
+                )
+            if allocation_metadata.get("qtype") not in (None, "gptq"):
+                raise ValueError(
+                    "Qwen3 quantization expects a plain GPTQ allocation, got "
+                    f"{allocation_metadata['qtype']!r}."
+                )
+        except ValueError as error:
+            if not args.allow_artifact_mismatch:
+                raise
+            warnings.warn(f"Ignoring artifact mismatch: {error}", stacklevel=1)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -60,6 +100,19 @@ def main():
         seed=args.seed,
         batch_size=args.batch_size,
     )
+    if allocation_metadata is not None:
+        try:
+            validate_calibration_artifacts(
+                [
+                    ("allocation qconfig", allocation_metadata),
+                    ("quantization inputs", {"calibration": calibration_metadata}),
+                ],
+                calibration_metadata,
+            )
+        except ValueError as error:
+            if not args.allow_artifact_mismatch:
+                raise
+            warnings.warn(f"Ignoring artifact mismatch: {error}", stacklevel=1)
     qconfig = build_qmodel_cfg_from_json(args.qconfig)
 
     model = AutoModelForCausalLM.from_pretrained(

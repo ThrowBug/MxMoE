@@ -15,6 +15,11 @@ from project_config import *
 from mxmoe.kernels.qconfig import QLinearConfig
 from mxmoe.kernels.tile_config import TileConfig, QConfig, NO_QUANT, get_possible_tile_list
 from mxmoe.kernels.compose_kernel import is_fusion_compatible, QCFG_MAP
+from mxmoe.quant.artifact_utils import (
+    load_optional_metadata,
+    validate_calibration_artifacts,
+    write_metadata,
+)
 
 
 def value_to_prob(freq: list[int]| list[float]) -> list[float]:
@@ -94,6 +99,24 @@ def get_strategy_loss(calib_loss_list: dict[str, str], filter_list: list[str], q
         strategy_loss[strategy] = layerwise_loss
 
     return strategy_loss
+
+
+def parse_loss_file_overrides(values: list[str]) -> dict[str, str]:
+    overrides = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                f"Invalid --loss_file {value!r}; expected QUANT_SCHEME=PATH."
+            )
+        quant_scheme, path = value.split("=", 1)
+        if not quant_scheme or not path:
+            raise ValueError(
+                f"Invalid --loss_file {value!r}; expected QUANT_SCHEME=PATH."
+            )
+        if quant_scheme in overrides:
+            raise ValueError(f"Duplicate --loss_file for {quant_scheme!r}.")
+        overrides[quant_scheme] = path
+    return overrides
 
 
 ExpertLoss = tuple[float, float, float]
@@ -703,6 +726,11 @@ if __name__ == "__main__":
     parser.add_argument("--trace_file", type=str, default=None, help="Expert activation frequency trace")
     parser.add_argument("--perf_file", type=str, default=f"{CUR_DIR}/calib/perf/performance_table.json", help="kernel performance profile")
     parser.add_argument("--exp_alloc", action="store_true", help="use expert-level allocation instead of linear-block level")
+    parser.add_argument("--loss_file", action="append", default=[], metavar="SCHEME=PATH", help="Override a calibration-loss artifact without changing legacy project_config entries.")
+    parser.add_argument("--calib_dataset", type=str, default=None, help="Expected calibration dataset for artifact validation.")
+    parser.add_argument("--nsamples", type=int, default=None, help="Expected calibration sample count for artifact validation.")
+    parser.add_argument("--seqlen", type=int, default=None, help="Expected calibration sequence length for artifact validation.")
+    parser.add_argument("--seed", type=int, default=None, help="Expected calibration seed for artifact validation.")
 
     args = parser.parse_args(
         # [
@@ -726,7 +754,9 @@ if __name__ == "__main__":
     print(args)
     ############################################################################
     # {quant_strategy: loss_file}
-    calib_loss_list: dict[str, str] = EXPERT_QUANT_LOSS[qtype][model_id]
+    calib_loss_list: dict[str, str] = dict(EXPERT_QUANT_LOSS[qtype][model_id])
+    loss_file_overrides = parse_loss_file_overrides(args.loss_file)
+    calib_loss_list.update(loss_file_overrides)
     print(
         (
             f"### Model: {ID2NAME[model_id]}\n"
@@ -749,6 +779,21 @@ if __name__ == "__main__":
     if len(args.filter_list) != 0:
         filter_list = args.filter_list
 
+    selected_loss_files = {
+        qname: loss_file
+        for qname, loss_file in calib_loss_list.items()
+        if any(item in qname for item in filter_list)
+    }
+    missing_schemes = [
+        item
+        for item in filter_list
+        if not any(item in qname for qname in selected_loss_files)
+    ]
+    if missing_schemes:
+        raise ValueError(
+            f"No calibration-loss artifact configured for: {missing_schemes}."
+        )
+
     if (
         model_id == "qwen3_moe_30b_a3b_instruct_2507"
         and args.r != 1.0
@@ -761,7 +806,39 @@ if __name__ == "__main__":
         )
 
     offline_stats = get_offline_stats(model_id, args.trace_file, args.perf_file)
-    strategy_loss = get_strategy_loss(calib_loss_list, filter_list, qtype)
+    expected_calibration = {
+        "dataset": args.calib_dataset,
+        "nsamples": args.nsamples,
+        "seqlen": args.seqlen,
+        "seed": args.seed,
+    }
+    artifact_metadata = [("trace", {"calibration": offline_stats.get("calibration")})]
+    artifact_metadata.extend(
+        (
+            f"loss[{qname}]",
+            load_optional_metadata(loss_file, artifact_name=f"loss[{qname}]"),
+        )
+        for qname, loss_file in selected_loss_files.items()
+    )
+    calibration_hash = validate_calibration_artifacts(
+        artifact_metadata, expected_calibration
+    )
+
+    expected_model = ID2NAME[model_id]
+    loss_models = {
+        str(metadata["model"])
+        for artifact_name, metadata in artifact_metadata
+        if artifact_name.startswith("loss[")
+        and metadata is not None
+        and metadata.get("model") is not None
+    }
+    if loss_models and loss_models != {expected_model}:
+        raise ValueError(
+            f"Calibration-loss model mismatch: expected {expected_model!r}, "
+            f"got {sorted(loss_models)!r}."
+        )
+
+    strategy_loss = get_strategy_loss(selected_loss_files, filter_list, qtype)
     num_layers = len(next(iter(strategy_loss.values())))
 
     print(f"### performance_table: {offline_stats['performance_table'].keys()}")
@@ -789,4 +866,34 @@ if __name__ == "__main__":
 
         mxdir = "+".join(filter_list)
         exp_alloc = "" if not args.exp_alloc else "_exp_alloc"
-        export_qconfig(model_qconfig, f"{CUR_DIR}/qconfigs/{mxdir}/{model_id}_{qtype}_S{solve_mode}_bs{batch_range}_wbits{args.wbits}_r{r}{exp_alloc}.json")
+        qconfig_path = f"{CUR_DIR}/qconfigs/{mxdir}/{model_id}_{qtype}_S{solve_mode}_bs{batch_range}_wbits{args.wbits}_r{r}{exp_alloc}.json"
+        export_qconfig(model_qconfig, qconfig_path)
+        qconfig_calibration = {
+            key: value
+            for key, value in expected_calibration.items()
+            if value is not None
+        }
+        if calibration_hash is not None:
+            qconfig_calibration["input_ids_sha256"] = calibration_hash
+        write_metadata(
+            qconfig_path,
+            {
+                "format": "mxmoe-allocation-v1",
+                "model_id": model_id,
+                "model": ID2NAME[model_id],
+                "qtype": qtype,
+                "calibration": qconfig_calibration,
+                "trace_file": os.path.abspath(args.trace_file),
+                "perf_file": os.path.abspath(args.perf_file),
+                "loss_files": {
+                    qname: os.path.abspath(path)
+                    for qname, path in selected_loss_files.items()
+                },
+                "filter_list": filter_list,
+                "solve_mode": solve_mode,
+                "batch": batch_range,
+                "effective_wbits": args.wbits,
+                "accuracy_weight": r,
+                "expert_level_allocation": args.exp_alloc,
+            },
+        )

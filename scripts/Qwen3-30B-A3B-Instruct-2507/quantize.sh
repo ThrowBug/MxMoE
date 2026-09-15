@@ -10,7 +10,10 @@ calib_dataset="${CALIB_DATASET:-c4}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
-qconfig="${QCONFIG:-qconfigs/w1a16_g128_asym+w2a16_g128_asym+w3a16_g128_asym/qwen3_moe_30b_a3b_instruct_2507_gptq_Slayer_bs8192_wbits2.25_r1.0.json}"
+profile_batch="${PROFILE_BATCH:-8192}"
+effective_bits="$(python -c 'import sys; print(float(sys.argv[1]))' "${MXMOE_EFFECTIVE_BITS:-2.25}")"
+accuracy_weight="$(python -c 'import sys; print(float(sys.argv[1]))' "${ACCURACY_WEIGHT:-1.0}")"
+qconfig="${QCONFIG:-qconfigs/w1a16_g128_asym+w2a16_g128_asym+w3a16_g128_asym/qwen3_moe_30b_a3b_instruct_2507_gptq_Slayer_bs${profile_batch}_wbits${effective_bits}_r${accuracy_weight}.json}"
 output="${OUTPUT:-results/fake_quant_models/Qwen/Qwen3-30B-A3B-Instruct-2507/MxMoE/C4-Seed${seed}_E2.0-A4-D4}"
 
 python -m mxmoe.quant.qwen3_quantize \
