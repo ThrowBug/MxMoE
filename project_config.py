@@ -12,6 +12,7 @@ ID2NAME = {
     "qwen2_moe": "/root/workspace/models/Qwen1.5-MoE-A2.7B",
     "qwen2_moe_57b": "/data/duanmuhaojie/.cache/huggingface/hub/models--Qwen--Qwen2-57B-A14B-Instruct/snapshots/50896d66b39f1425d63720541a66c7df13e053c0",
     "qwen3_moe_30b_a3b_instruct_2507": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "qwen3_5_moe_35b_a3b": "Qwen/Qwen3.5-35B-A3B",
 }
 
 EXPERT_QUANT_LOSS = {
