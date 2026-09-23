@@ -9,6 +9,12 @@ calib_dataset="${CALIB_DATASET:-c4}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
+nominal_bits="$(python -c 'import sys; print(float(sys.argv[1]))' "${NOMINAL_BITS:-2.0}")"
+if [[ -n "${MXMOE_EFFECTIVE_BITS:-}" ]]; then
+  effective_bits="$(python -c 'import sys; print(float(sys.argv[1]))' "${MXMOE_EFFECTIVE_BITS}")"
+else
+  effective_bits="$(python -c 'import sys; print(float(sys.argv[1]) + 0.25)' "${nominal_bits}")"
+fi
 model_id="qwen3_moe_30b_a3b_instruct_2507"
 loss_dir="calib/${model_id}"
 loss_suffix="${calib_dataset}-${nsamples}-${seqlen}-layer_out_norm.json"
@@ -17,11 +23,12 @@ w2_loss="${LOSS_W2:-${loss_dir}/${model_id}-MOE-gptq-W2A16_g128_asym-${loss_suff
 w3_loss="${LOSS_W3:-${loss_dir}/${model_id}-MOE-gptq-W3A16_g128_asym-${loss_suffix}}"
 
 # G128 contributes 0.25 metadata bits in MxMoE's original budget accounting.
-# Thus 2.25 here corresponds to a 2.0 nominal average over expert weights.
+# NOMINAL_BITS defaults to 2.0; MXMOE_EFFECTIVE_BITS can explicitly override
+# the automatically derived nominal + 0.25 allocation budget.
 python -m mxmoe.quant.bits_solver \
   --model "${model_id}" \
   --qtype gptq \
-  --wbits "${MXMOE_EFFECTIVE_BITS:-2.25}" \
+  --wbits "${effective_bits}" \
   --solve_mode layer \
   --batch "${PROFILE_BATCH:-8192}" \
   --r "${ACCURACY_WEIGHT:-1.0}" \
