@@ -12,6 +12,7 @@ from mxmoe.quant.qwen35_allocate import allocate_layer
 from mxmoe.quant.qwen35_core import (
     expert_weight, fixed_linears, kwargs_for_layer, selected_tokens, validate_allocation,
 )
+from mxmoe.quant.qwen35_pipeline import same_model_source
 
 
 class PackedExperts(nn.Module):
@@ -41,6 +42,16 @@ class ToyLayer(nn.Module):
 
 
 class CoreTests(unittest.TestCase):
+    def test_hub_id_and_local_model_copy_are_equivalent_sources(self):
+        self.assertTrue(same_model_source(
+            "Qwen/Qwen3.5-35B-A3B",
+            "/models/Qwen3.5-35B-A3B",
+        ))
+        self.assertFalse(same_model_source(
+            "Qwen/Qwen3.5-35B-A3B",
+            "/models/another-qwen35-checkpoint",
+        ))
+
     def test_packed_gate_up_down_slices(self):
         experts = PackedExperts()
         self.assertEqual(tuple(expert_weight(experts, 1, "gate").shape), (4, 4))

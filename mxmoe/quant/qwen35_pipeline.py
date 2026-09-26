@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import torch
@@ -24,6 +25,27 @@ from mxmoe.quant.qwen35_core import (
 
 DEFAULT_MODEL = "Qwen/Qwen3.5-35B-A3B"
 MODEL_ID = "qwen3_5_moe_35b_a3b"
+MODEL_BASENAME = DEFAULT_MODEL.rsplit("/", 1)[-1]
+
+
+def same_model_source(recorded, current):
+    """Treat the Hub ID and a local copy of the same named model as aliases."""
+    if recorded == current:
+        return True
+    if not isinstance(recorded, str) or not isinstance(current, str):
+        return False
+    recorded_path = Path(recorded).expanduser()
+    current_path = Path(current).expanduser()
+    try:
+        if recorded_path.exists() and current_path.exists():
+            return recorded_path.resolve() == current_path.resolve()
+    except OSError:
+        pass
+
+    def basename(value):
+        return value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+    return basename(recorded) == MODEL_BASENAME and basename(current) == MODEL_BASENAME
 
 
 def fixed_settings(args):
@@ -205,9 +227,25 @@ def quantize_final(args, tokenizer, samples, calib_meta):
     validate_calibration_artifacts(
         [("allocation", allocation_meta), ("current inputs", {"calibration": calib_meta})], calib_meta
     )
-    if (allocation_meta.get("model") != args.model
-            or allocation_meta.get("fixed_config") != fixed_settings(args)):
-        raise ValueError("Allocation model or fixed-bit settings disagree.")
+    allocation_model = allocation_meta.get("model")
+    if not same_model_source(allocation_model, args.model):
+        raise ValueError(
+            "Allocation model disagrees with this run: "
+            f"qconfig={allocation_model!r}, current={args.model!r}."
+        )
+    if allocation_model != args.model:
+        warnings.warn(
+            "The allocation records a different model source string, but both "
+            f"identify {MODEL_BASENAME}; using the current source {args.model!r}.",
+            stacklevel=1,
+        )
+    allocation_fixed = allocation_meta.get("fixed_config")
+    current_fixed = fixed_settings(args)
+    if allocation_fixed != current_fixed:
+        raise ValueError(
+            "Allocation fixed-bit settings disagree with this run: "
+            f"qconfig={allocation_fixed!r}, current={current_fixed!r}."
+        )
     model = load_model(args.model)
     qconfig = build_qmodel_cfg_from_json(args.qconfig)
     summary = validate_allocation(model, qconfig, args.groupsize)
